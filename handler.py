@@ -313,7 +313,7 @@ Instructions:
     _log_question_answer(context, prompt, answer)
 
     # Send the answer via email (if configured)
-    subject = f"Answer to: {context.message_text[:50]}..." if len(context.message_text) > 50 else f"Answer to: {context.message_text}"
+    subject = f"AI ASSISTANT: Answer to: {context.message_text[:50]}..." if len(context.message_text) > 50 else f"AI ASSISTANT: Answer to: {context.message_text}"
     body = f"""Question received at {context.timestamp} from {context.from_number}:
 
 Q: {context.message_text}
@@ -547,7 +547,7 @@ def handler(event, context):
             process_actions(actions, action_context)
 
         # Send email notification
-        subject = f"Message {message_sid} Stored"
+        subject = f"AI ASSISTANT: Message {message_sid} Stored"
         attachment = updated_log if ATTACH_LOG_FILE else None
         send_email(subject, log_entry, attachment, 'message_log.log')
 
