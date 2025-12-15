@@ -1,4 +1,5 @@
 import boto3
+import json
 import os
 import base64
 import re
@@ -140,34 +141,37 @@ def write_log_to_s3(s3_client, bucket, key, content):
     )
 
 
-def send_notification_email(message_sid, log_entry, full_log=None):
+def send_email(subject, body, attachment=None, attachment_filename='attachment.txt'):
     """
-    Send email notification for logged message.
-    If full_log provided and ATTACH_LOG_FILE is true, attach it.
-    Best-effort: logs errors but doesn't raise.
+    Send an email via SES.
+
+    Args:
+        subject: Email subject line
+        body: Email body text
+        attachment: Optional string content to attach
+        attachment_filename: Filename for the attachment
+
+    Returns True if sent, False otherwise.
     """
     if not NOTIFICATION_EMAIL:
-        print("NOTIFICATION_EMAIL not configured, skipping email notification")
-        return
+        print("NOTIFICATION_EMAIL not configured, skipping email")
+        return False
 
     try:
         ses_client = boto3.client('ses', region_name='us-east-1')
-        subject = f"Assistant {message_sid} Stored"
 
-        if ATTACH_LOG_FILE and full_log:
+        if attachment:
             # Build multipart message with attachment
             msg = MIMEMultipart()
             msg['Subject'] = subject
             msg['From'] = NOTIFICATION_EMAIL
             msg['To'] = NOTIFICATION_EMAIL
 
-            # Body
-            msg.attach(MIMEText(log_entry, 'plain'))
+            msg.attach(MIMEText(body, 'plain'))
 
-            # Attachment
-            attachment = MIMEApplication(full_log.encode('utf-8'))
-            attachment.add_header('Content-Disposition', 'attachment', filename='message_log.log')
-            msg.attach(attachment)
+            att = MIMEApplication(attachment.encode('utf-8'))
+            att.add_header('Content-Disposition', 'attachment', filename=attachment_filename)
+            msg.attach(att)
 
             ses_client.send_raw_email(
                 Source=NOTIFICATION_EMAIL,
@@ -175,21 +179,197 @@ def send_notification_email(message_sid, log_entry, full_log=None):
                 RawMessage={'Data': msg.as_string()}
             )
         else:
-            # Simple email without attachment
             ses_client.send_email(
                 Source=NOTIFICATION_EMAIL,
                 Destination={'ToAddresses': [NOTIFICATION_EMAIL]},
                 Message={
                     'Subject': {'Data': subject, 'Charset': 'UTF-8'},
-                    'Body': {'Text': {'Data': log_entry, 'Charset': 'UTF-8'}}
+                    'Body': {'Text': {'Data': body, 'Charset': 'UTF-8'}}
                 }
             )
 
-        print(f"Notification email sent for {message_sid}")
+        print(f"Email sent: {subject[:50]}")
+        return True
 
     except Exception as e:
-        print(f"Error sending notification email: {e}")
+        print(f"Error sending email: {e}")
+        return False
 
+
+# =============================================================================
+# Action Processors
+# =============================================================================
+# Each action processor is a self-contained function that handles all logic
+# for a specific action, including prompts, API calls, and notifications.
+
+# Registry of action processors: action_name -> processor_function
+ACTION_PROCESSORS = {}
+
+
+def action_processor(action_name):
+    """Decorator to register an action processor."""
+    def decorator(func):
+        ACTION_PROCESSORS[action_name] = func
+        return func
+    return decorator
+
+
+class ActionContext:
+    """Context passed to action processors with all relevant data."""
+    def __init__(self, message_text, log_content, from_number, to_number,
+                 message_sid, location, timestamp, s3_client, bucket):
+        self.message_text = message_text
+        self.log_content = log_content
+        self.from_number = from_number
+        self.to_number = to_number
+        self.message_sid = message_sid
+        self.location = location
+        self.timestamp = timestamp
+        self.s3_client = s3_client
+        self.bucket = bucket
+
+
+def process_actions(actions, context):
+    """
+    Process all actions for a message.
+    Returns list of results from each processor.
+    """
+    results = []
+    for action in actions:
+        processor = ACTION_PROCESSORS.get(action)
+        if processor:
+            try:
+                result = processor(context)
+                results.append({'action': action, 'success': True, 'result': result})
+                print(f"Action '{action}' processed successfully")
+            except Exception as e:
+                results.append({'action': action, 'success': False, 'error': str(e)})
+                print(f"Action '{action}' failed: {e}")
+        else:
+            print(f"No processor registered for action: {action}")
+    return results
+
+
+# -----------------------------------------------------------------------------
+# /question - Ask Claude a question about the message log
+# -----------------------------------------------------------------------------
+@action_processor('question')
+def process_question_action(context):
+    """
+    Process the /question action.
+    Sends the full log to Claude on Bedrock and emails the response.
+    """
+    
+    PROMPT_TEMPLATE = """You are a personal assistant with access to the user's note history. Your job is to help them recall information they've stored - facts, reminders, and notes about people, places, things, events, and ideas. You can also make inferences based on all the facts when needed to add additional context and insight.
+
+The notes are stored as SMS messages in a tab-delimited log with these fields:
+timestamp, message_sid, to_number, location, actions, num_media, media_keys, message_text
+
+The "message_text" field contains the actual note content. Pay close attention to names, descriptions, dates, locations, and any identifying details.
+
+Here is the complete note history:
+--- NOTES ---
+{log_content}
+--- END NOTES ---
+
+The user is asking:
+{question}
+
+Instructions:
+- Search through all notes to find relevant information
+- If you find a match, provide the specific details from the note(s)
+- Include the date/timestamp when the note was recorded if it helps provide context
+- If multiple notes are relevant, synthesize the information
+- If you can't find relevant information, say so clearly
+- Be concise and direct - the user wants facts, not lengthy explanations
+- If the question is ambiguous, make reasonable assumptions and note them"""
+
+    # Build the prompt with injected log and question
+    prompt = PROMPT_TEMPLATE.format(
+        log_content=context.log_content or "(empty log)",
+        question=context.message_text or "Summarize the log"
+    )
+
+    # Call Claude on Bedrock
+    bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+    response = bedrock.invoke_model(
+        modelId='anthropic.claude-3-haiku-20240307-v1:0',
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
+
+    result = json.loads(response['body'].read())
+    answer = result['content'][0]['text']
+
+    # Log Q&A to stdout (CloudWatch)
+    print(f"Q: {context.message_text}")
+    print(f"A: {answer}")
+
+    # Save Q&A to separate markdown file
+    _log_question_answer(context, prompt, answer)
+
+    # Send the answer via email (if configured)
+    subject = f"AI ASSISTANT: Answer to: {context.message_text[:50]}..." if len(context.message_text) > 50 else f"AI ASSISTANT: Answer to: {context.message_text}"
+    body = f"""Question received at {context.timestamp} from {context.from_number}:
+
+Q: {context.message_text}
+
+A: {answer}
+
+---
+Message SID: {context.message_sid}
+"""
+    send_email(subject, body)
+
+    return answer
+
+
+def _log_question_answer(context, prompt, answer):
+    """Save the Q&A to a separate markdown file."""
+    try:
+        qa_key = f"qa/{context.message_sid}_qa.md"
+
+        qa_content = f"""# Q&A Response
+
+## Metadata
+- **Timestamp:** {context.timestamp}
+- **Message SID:** {context.message_sid}
+- **From:** {context.from_number}
+- **To:** {context.to_number}
+- **Location:** {context.location}
+
+## Question
+{context.message_text}
+
+## Prompt Sent to Bedrock
+```
+{prompt}
+```
+
+## Answer
+{answer}
+"""
+
+        context.s3_client.put_object(
+            Bucket=context.bucket,
+            Key=qa_key,
+            Body=qa_content.encode('utf-8'),
+            ContentType='text/markdown'
+        )
+
+        print(f"Saved Q&A to {qa_key}")
+
+    except Exception as e:
+        print(f"Error saving Q&A: {e}")
+
+
+# =============================================================================
+# Media Handling
+# =============================================================================
 
 def download_and_save_media(s3_client, bucket, media_url, content_type, message_sid, index):
     """
@@ -351,8 +531,25 @@ def handler(event, context):
         updated_log = existing_log + log_entry
         write_log_to_s3(s3_client, S3_BUCKET_NAME, log_key, updated_log)
 
+        # Process any actions
+        if actions:
+            action_context = ActionContext(
+                message_text=message_text,
+                log_content=updated_log,
+                from_number=from_number,
+                to_number=to_number,
+                message_sid=message_sid,
+                location=location,
+                timestamp=timestamp,
+                s3_client=s3_client,
+                bucket=S3_BUCKET_NAME
+            )
+            process_actions(actions, action_context)
+
         # Send email notification
-        send_notification_email(message_sid, log_entry, updated_log if ATTACH_LOG_FILE else None)
+        subject = f"AI ASSISTANT: Message {message_sid} Stored"
+        attachment = updated_log if ATTACH_LOG_FILE else None
+        send_email(subject, log_entry, attachment, 'message_log.log')
 
         print(f"Logged message from {from_number} | actions: {actions} | media: {num_media} | text: {message_text[:50] if message_text else '(empty)'}")
 
